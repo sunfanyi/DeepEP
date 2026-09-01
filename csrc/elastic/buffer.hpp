@@ -90,7 +90,7 @@ public:
                   const bool& explicitly_destroy):
         num_buffer_bytes(num_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(get_global_comm_stream()),
+        comm_stream(at::cuda::getStreamFromPool(true)),
         deterministic(deterministic),
         allow_hybrid_mode(allow_hybrid_mode),
         allow_multiple_reduction(allow_multiple_reduction),

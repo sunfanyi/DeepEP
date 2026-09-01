@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "2.0.0+018f21e.afd1"
+__version__ = "2.0.0+018f21e.afd2"
 UPSTREAM_COMMIT = "018f21ea62c6c2888d9b46806aad6d90b399b23d"
 TOPK_IDX_BITS = 64
 
