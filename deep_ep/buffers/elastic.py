@@ -768,6 +768,7 @@ class ElasticBuffer:
          num_recv_tokens_per_expert_list,
          psum_num_recv_tokens_per_scaleup_rank,
          psum_num_recv_tokens_per_expert,
+         _masked_m,
          recv_src_metadata,
          dst_buffer_slot_idx,
          token_metadata_at_forward,
@@ -788,7 +789,8 @@ class ElasticBuffer:
                                         previous_event_before_epilogue,
                                         async_with_compute_stream, allocate_on_comm_stream,
                                         do_handle_copy, do_cpu_sync, do_expand,
-                                        use_tma_aligned_col_major_sf)
+                                        use_tma_aligned_col_major_sf,
+                                        False, None, 0)
         if handle is None:
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,

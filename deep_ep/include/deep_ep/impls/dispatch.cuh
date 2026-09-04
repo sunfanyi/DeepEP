@@ -9,6 +9,7 @@
 #include <deep_ep/common/handle.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
+#include <deep_ep/common/nvfp4.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 
@@ -17,12 +18,13 @@ namespace deep_ep::elastic {
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kUseNVFP4,
           int kNumSMs,
           int kNumNotifyWarps, int kNumDispatchWarps,
           int kNumRanks,
-          int kNumHiddenBytes, int kNumSFPacks,
+          int kHidden, int kNumHiddenBytes, int kNumSFPacks,
           int kNumMaxTokensPerRank,
-          int kNumExperts, int kNumTopk, int kExpertAlignment,
+          int kNumExperts, int kNumTopk, int kExpertAlignment, int kExpertCapacity,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumDispatchThreads = kNumDispatchWarps * 32,
@@ -30,11 +32,13 @@ template <bool kIsScaleupNVLink,
           typename team_t = std::conditional_t<kIsScaleupNVLink, ncclTeamTagLsa, ncclTeamTagWorld>>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch_impl(
-    void* x, sf_pack_t* sf, topk_idx_t* topk_idx, float* topk_weights,
+    void* x, sf_pack_t* sf, float* x_global_scale,
+    topk_idx_t* topk_idx, float* topk_weights,
     topk_idx_t* copied_topk_idx,
     int* cumulative_local_expert_recv_stats,
     int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert,
+    int* num_recv_tokens_per_expert,
     int* dst_buffer_slot_idx,
     const int num_tokens,
     const int sf_token_stride, const int sf_hidden_stride,
@@ -44,6 +48,7 @@ dispatch_impl(
 ) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    EP_STATIC_ASSERT(not kUseNVFP4 or kExpertCapacity > 0, "Invalid NVFP4 expert capacity");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
 
     // Utils
@@ -206,7 +211,11 @@ dispatch_impl(
                 #pragma unroll
                 for (int j = 0; j < kNumRanks; ++ j)
                     sum += expert_count[j * kNumExpertsPerRank + i];
-                expert_count[i] = math::align(sum, kExpertAlignment);
+                expert_count[i] = kUseNVFP4 ? sum : math::align(sum, kExpertAlignment);
+                if constexpr (kUseNVFP4) {
+                    EP_DEVICE_ASSERT(sum <= kExpertCapacity);
+                    num_recv_tokens_per_expert[i] = sum;
+                }
 
                 // Update statistics counters
                 if (cumulative_local_expert_recv_stats != nullptr)
@@ -247,7 +256,13 @@ dispatch_impl(
                 do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, kNumRanks, 0);
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
-                do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+                if constexpr (kUseNVFP4) {
+                    #pragma unroll
+                    for (int i = lane_idx; i < kNumExpertsPerRank + 1; i += 32)
+                        psum_num_recv_tokens_per_expert[i] = i * kExpertCapacity;
+                } else {
+                    do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+                }
             }
         }
     } else {
@@ -278,15 +293,21 @@ dispatch_impl(
             ptx::tma_store_wait();
             __syncwarp();
 
-            // Issue data TMA
-            if (ptx::elect_one_sync()) {
-                ptx::tma_load_1d(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
-                                 mbarrier_ptr, kNumHiddenBytes);
+            // Load or quantize the token into the wire layout
+            if constexpr (kUseNVFP4) {
+                nvfp4::quantize_token<kHidden>(
+                    x, tma_buffer.get_hidden_ptr(), tma_buffer.get_sf_ptr(),
+                    *x_global_scale, token_idx, lane_idx);
+            } else {
+                if (ptx::elect_one_sync()) {
+                    ptx::tma_load_1d(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
+                                     mbarrier_ptr, kNumHiddenBytes);
+                }
+                __syncwarp();
             }
-            __syncwarp();
 
-            // Issue SF TMA or cp.async
-            if constexpr (kNumSFPacks > 0) {
+            // Issue pre-quantized SF TMA or cp.async
+            if constexpr (kNumSFPacks > 0 and not kUseNVFP4) {
                 EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "Unaligned SF element type");
                 const auto gmem_src_ptr = math::advance_ptr<sf_pack_t>(sf, token_i64_idx * sf_token_stride * sizeof(sf_pack_t));
                 const auto smem_dst_ptr = tma_buffer.get_sf_ptr();
@@ -347,9 +368,11 @@ dispatch_impl(
 
             // Wait TMA load arrival
             // NOTES: this arrive must be after the `ptx::cp_async_mbarrier_arrive`
-            if (ptx::elect_one_sync()) {
-                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+            if constexpr (not kUseNVFP4) {
+                if (ptx::elect_one_sync()) {
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
             }
             __syncwarp();
 

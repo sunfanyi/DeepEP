@@ -527,12 +527,12 @@ public:
     }
 
     static int64_t get_dispatch_buffer_size(const int& num_max_tokens_per_rank,
-                                            const int& hidden, const int& num_sf_packs, const int& num_topk,
-                                            const int& elem_size,
+                                            const int& num_hidden_bytes,
+                                            const int& num_sf_packs, const int& num_topk,
                                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                             const bool& is_scaleup_nvlink) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
-        const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
+        const auto token_layout = get_dispatch_token_layout(num_hidden_bytes, num_sf_packs, num_topk);
 
         if (num_scaleout_ranks == 1) {
             // Direct dispatch
@@ -614,7 +614,7 @@ public:
         const auto elem_size = use_fp8_dispatch ? sizeof(__nv_fp8_e4m3) : sizeof(nv_bfloat16);
         const auto num_sf_packs = use_fp8_dispatch ? math::ceil_div(hidden, 32) : 0; // An approximation for number of SF packs
         const auto num_dispatch_bytes = get_dispatch_buffer_size(
-            num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
+            num_max_tokens_per_rank, hidden * elem_size, num_sf_packs, num_topk,
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink);
 
@@ -632,7 +632,8 @@ public:
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
                std::vector<int>,
-               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, std::optional<torch::Tensor>,
+               torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     dispatch(const torch::Tensor& x,
@@ -655,7 +656,10 @@ public:
              const bool& async_with_compute_stream,
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
-             const bool& use_tma_aligned_col_major_sf) const {
+             const bool& use_tma_aligned_col_major_sf,
+             const bool& use_nvfp4,
+             const std::optional<torch::Tensor>& x_global_scale,
+             const int& expert_capacity) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -677,11 +681,25 @@ public:
 
         // Check data tensor
         const auto [num_tokens, hidden] = get_shape<2>(x);
-        const auto num_hidden_bytes = hidden * static_cast<int>(x.element_size());
+        const auto source_num_hidden_bytes = hidden * static_cast<int>(x.element_size());
+        const auto wire_num_hidden_bytes = use_nvfp4 ? hidden / 2 : source_num_hidden_bytes;
         const auto num_local_experts = num_experts / nccl_context->num_ranks;
         EP_HOST_ASSERT(x.is_cuda() and x.is_contiguous());
         EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
         EP_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+        if (use_nvfp4) {
+            EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+            EP_HOST_ASSERT(not sf.has_value());
+            EP_HOST_ASSERT(do_expand);
+            EP_HOST_ASSERT(hidden % 256 == 0);
+            EP_HOST_ASSERT(expert_capacity > 0 and expert_capacity % 128 == 0);
+            EP_HOST_ASSERT(x_global_scale.has_value());
+            EP_HOST_ASSERT(x_global_scale->is_cuda() and x_global_scale->dim() == 0);
+            EP_HOST_ASSERT(x_global_scale->scalar_type() == torch::kFloat);
+        } else {
+            EP_HOST_ASSERT(not x_global_scale.has_value());
+            EP_HOST_ASSERT(expert_capacity == 0);
+        }
 
         // Check SF stuffs
         int num_sf_packs = 0;
@@ -698,6 +716,8 @@ public:
             sf_token_stride = sf->stride(0);
             sf_hidden_stride = sf->stride(1);
         }
+        if (use_nvfp4)
+            num_sf_packs = hidden / 64;
 
         // Check top-k stuffs
         const auto [num_tokens_, num_topk] = get_shape<2>(topk_idx);
@@ -761,7 +781,7 @@ public:
         int num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
         if (nccl_context->num_scaleout_ranks > 1) {
-            const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
+            const auto dispatch_token_layout = get_dispatch_token_layout(wire_num_hidden_bytes, num_sf_packs, num_topk);
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
             EP_HOST_ASSERT(num_sms <= kNumMaxSMs);
             num_channels_per_sm = std::min<int>(
@@ -897,9 +917,12 @@ public:
 
         // Check buffer size
         EP_HOST_ASSERT(get_dispatch_buffer_size(
-                       num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
+                       num_max_tokens_per_rank, wire_num_hidden_bytes, num_sf_packs, num_topk,
                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                        nccl_context->is_scaleup_nvlink) <= num_buffer_bytes);
+
+        auto num_recv_tokens_per_expert = use_nvfp4 ? std::optional<torch::Tensor>(torch::empty(
+            {num_local_experts}, at::TensorOptions(torch::kCUDA).dtype(torch::kInt))) : std::nullopt;
 
         // Ready and clean host workspace for this round
         const auto host_workspace_layout = layout::WorkspaceLayout(
@@ -914,17 +937,20 @@ public:
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
+                        x_global_scale.has_value() ? x_global_scale->data_ptr<float>() : nullptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                         copied_topk_idx_ptr,
                         cumulative_local_expert_recv_stats_ptr,
                         psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                         psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                        num_recv_tokens_per_expert.has_value() ? num_recv_tokens_per_expert->data_ptr<int>() : nullptr,
                         dst_buffer_slot_idx.data_ptr<int>(),
                         token_metadata_at_forward_ptr,
                         num_tokens, num_max_tokens_per_rank,
                         hidden, x.element_size(),
                         num_sf_packs, sf_token_stride, sf_hidden_stride,
                         num_experts, num_topk, expert_alignment,
+                        expert_capacity, use_nvfp4,
                         nccl_context->dev_comm, nccl_context->window,
                         buffer,
                         workspace, mapped_host_workspace,
@@ -1009,8 +1035,11 @@ public:
 
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
-        const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
-        auto recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        const auto num_allocated_tokens = use_nvfp4 ? num_local_experts * expert_capacity :
+            (do_expand ? num_expanded_tokens : num_recv_tokens);
+        auto recv_x = use_nvfp4 ?
+            torch::empty({num_local_experts, expert_capacity, hidden / 2}, x.options().dtype(torch::kUInt8)) :
+            torch::empty({num_allocated_tokens, hidden}, x.options());
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
@@ -1023,7 +1052,14 @@ public:
         topk_idx_t* recv_topk_idx_ptr = nullptr;
         float* recv_topk_weights_ptr = nullptr;
         int recv_sf_token_stride = 0, recv_sf_hidden_stride = 0;
-        if (sf.has_value()) {
+        if (use_nvfp4) {
+            recv_sf = torch::empty(
+                {num_local_experts, expert_capacity / 128, hidden / 64, 32, 4, 4},
+                x.options().dtype(torch::kFloat8_e4m3fn));
+            recv_sf_ptr = recv_sf->data_ptr();
+            recv_x = recv_x.permute({1, 2, 0});
+            recv_sf = recv_sf->permute({3, 4, 1, 5, 2, 0});
+        } else if (sf.has_value()) {
             if (not use_tma_aligned_col_major_sf) {
                 recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
             } else {
@@ -1067,9 +1103,10 @@ public:
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
                                       num_recv_tokens, num_max_tokens_per_rank,
-                                      num_hidden_bytes,
+                                      wire_num_hidden_bytes,
                                       num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
                                       num_experts, num_topk,
+                                      expert_capacity, use_nvfp4,
                                       nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
                                       nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                                       jit::device_runtime->get_num_sms(),
@@ -1080,8 +1117,9 @@ public:
 
         // Stream control
         const auto event = stream_control_epilogue(
-            {x, sf, topk_idx, topk_weights,
+            {x, sf, x_global_scale, topk_idx, topk_weights,
              recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+             num_recv_tokens_per_expert,
              cumulative_local_expert_recv_stats,
              copied_topk_idx,
              psum_num_recv_tokens_per_scaleup_rank,
@@ -1100,6 +1138,7 @@ public:
                 num_recv_tokens_per_expert_list,
                 psum_num_recv_tokens_per_scaleup_rank,
                 psum_num_recv_tokens_per_expert,
+                num_recv_tokens_per_expert,
                 recv_src_metadata,
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
