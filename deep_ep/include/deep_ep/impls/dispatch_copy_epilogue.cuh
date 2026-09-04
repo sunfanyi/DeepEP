@@ -3,6 +3,7 @@
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
+#include <deep_ep/common/nvfp4.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 
@@ -140,38 +141,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
         // Store SF
         if constexpr (kNumSFPacks > 0 and kUseNVFP4) {
-            constexpr int kNumScales = kNumSFPacks * sizeof(sf_pack_t);
-            constexpr int kScalePacksPerHidden = 4;
-            constexpr int kScaleTokenBlock = 128;
-            constexpr int kNumScaleColumns = kNumScales / kScalePacksPerHidden;
-            constexpr int kNumTokenBlocks = math::constexpr_ceil_div(kExpertCapacity, kScaleTokenBlock);
-            const auto src_scales = reinterpret_cast<const uint8_t*>(tma_buffer.get_sf_ptr());
-
-            auto mask = ptx::gather(dst_tensor_idx >= 0);
-            while (mask) {
-                const int valid_lane_idx = __ffs(mask) - 1;
-                const auto flat_idx = ptx::exchange(dst_tensor_idx, valid_lane_idx);
-                const auto expert_idx = flat_idx / kExpertCapacity;
-                const auto token_idx = flat_idx % kExpertCapacity;
-                auto dst_scales = reinterpret_cast<uint8_t*>(recv_sf) +
-                    expert_idx * kNumTokenBlocks * kNumScaleColumns * kScaleTokenBlock * kScalePacksPerHidden;
-
-                const auto token_block_idx = token_idx / kScaleTokenBlock;
-                const auto token_lane_idx = token_idx % 32;
-                const auto token_quad_idx = token_idx % kScaleTokenBlock / 32;
-                #pragma unroll
-                for (int i = lane_idx; i < kNumScales; i += 32) {
-                    const auto scale_column_idx = i / kScalePacksPerHidden;
-                    const auto scale_pack_idx = i % kScalePacksPerHidden;
-                    const auto offset =
-                        token_block_idx * (kNumScaleColumns * kScaleTokenBlock * kScalePacksPerHidden) +
-                        scale_column_idx * (kScaleTokenBlock * kScalePacksPerHidden) +
-                        token_lane_idx * (kScalePacksPerHidden * kScalePacksPerHidden) +
-                        token_quad_idx * kScalePacksPerHidden + scale_pack_idx;
-                    dst_scales[offset] = src_scales[i];
-                }
-                mask ^= 1 << valid_lane_idx;
-            }
+            nvfp4::store_expert_scales<kNumSFPacks, kExpertCapacity>(
+                tma_buffer.get_sf_ptr(), recv_sf, dst_tensor_idx, lane_idx);
         } else if constexpr (kNumSFPacks > 0) {
             constexpr auto kNumFullIters = kNumSFPacks / 32;
             const bool do_last_iter = (kNumSFPacks % 32 != 0) and (kNumFullIters * 32 + lane_idx < kNumSFPacks);

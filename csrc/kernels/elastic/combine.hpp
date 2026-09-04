@@ -15,7 +15,7 @@ public:
     struct Args {
         // Templated arguments
         bool is_scaleup_nvlink;
-        bool use_expanded_layout, allow_multiple_reduction;
+        bool use_expanded_layout, allow_multiple_reduction, apply_weights;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -28,6 +28,7 @@ public:
         // Parameters
         nv_bfloat16* x;
         float* topk_weights;
+        float routed_scaling_factor;
         int* src_metadata;
         int* psum_num_recv_tokens_per_scaleup_rank;
         int* token_metadata_at_forward;
@@ -46,9 +47,9 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "combine";
-            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.is_scaleup_nvlink,
-                                    args.use_expanded_layout, args.allow_multiple_reduction,
+                                    args.use_expanded_layout, args.allow_multiple_reduction, args.apply_weights,
                                     args.launch_args.grid_dim.first,
                                     args.launch_args.num_threads / 32,
                                     args.num_scaleup_ranks * args.num_scaleout_ranks,
@@ -59,8 +60,8 @@ public:
                                     args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_combine";
-            func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
-                                    args.use_expanded_layout, args.allow_multiple_reduction,
+            func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                                    args.use_expanded_layout, args.allow_multiple_reduction, args.apply_weights,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
                                     args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -85,7 +86,7 @@ static void __instantiate_kernel() {{
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
         if (args.num_scaleout_ranks == 1) {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
-                                                     args.x, args.topk_weights,
+                                                     args.x, args.topk_weights, args.routed_scaling_factor,
                                                      args.src_metadata, args.psum_num_recv_tokens_per_scaleup_rank,
                                                      args.nccl_dev_comm, args.nccl_window,
                                                      args.buffer, args.workspace,
@@ -93,7 +94,7 @@ static void __instantiate_kernel() {{
                                                      args.num_reduced_tokens));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
-                                                     args.x, args.topk_weights,
+                                                     args.x, args.topk_weights, args.routed_scaling_factor,
                                                      args.src_metadata,
                                                      args.psum_num_recv_tokens_per_scaleup_rank,
                                                      args.token_metadata_at_forward,
@@ -113,6 +114,7 @@ static layout::TokenLayout get_combine_token_layout(
 
 static void* launch_combine(void* x,
                             void* topk_weights,
+                            const float routed_scaling_factor,
                             int* src_metadata,
                             int* psum_num_recv_tokens_per_scaleup_rank,
                             int* token_metadata_at_forward,
@@ -153,6 +155,7 @@ static void* launch_combine(void* x,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .apply_weights = use_expanded_layout and topk_weights != nullptr,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
@@ -162,6 +165,7 @@ static void* launch_combine(void* x,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
         .x = static_cast<nv_bfloat16*>(x),
         .topk_weights = static_cast<float*>(topk_weights),
+        .routed_scaling_factor = routed_scaling_factor,
         .src_metadata = src_metadata,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .token_metadata_at_forward = token_metadata_at_forward,

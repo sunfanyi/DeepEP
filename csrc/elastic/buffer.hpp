@@ -1163,7 +1163,8 @@ public:
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& use_expanded_layout) const {
+            const bool& use_expanded_layout,
+            const float& routed_scaling_factor) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1192,12 +1193,14 @@ public:
         EP_HOST_ASSERT(src_metadata.scalar_type() == torch::kInt);
 
         // Check optional tensors
-        if (use_expanded_layout) {
-            // Reduction should be done with SwiGLU
-            EP_HOST_ASSERT(not topk_weights.has_value());
-        } else if (topk_weights.has_value()) {
-            const auto [num_tokens__, num_topk__] = get_shape<2>(topk_weights.value());
-            EP_HOST_ASSERT(num_tokens == num_tokens__ and num_topk == num_topk__);
+        if (topk_weights.has_value()) {
+            if (use_expanded_layout) {
+                const auto [num_tokens__] = get_shape<1>(topk_weights.value());
+                EP_HOST_ASSERT(num_tokens == num_tokens__);
+            } else {
+                const auto [num_tokens__, num_topk__] = get_shape<2>(topk_weights.value());
+                EP_HOST_ASSERT(num_tokens == num_tokens__ and num_topk == num_topk__);
+            }
             EP_HOST_ASSERT(topk_weights->is_cuda() and topk_weights->is_contiguous());
             EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat);
         }
@@ -1253,6 +1256,7 @@ public:
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
+            routed_scaling_factor,
             src_metadata.data_ptr<int>(),
             psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
             token_metadata_at_forward_ptr,
@@ -1274,7 +1278,7 @@ public:
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
         auto combined_topk_weights = std::optional<torch::Tensor>();
         float* combined_topk_weights_ptr = nullptr;
-        if (topk_weights.has_value()) {
+        if (topk_weights.has_value() and not use_expanded_layout) {
             combined_topk_weights = torch::empty({num_combined_tokens, num_topk}, topk_weights->options());
             combined_topk_weights_ptr = combined_topk_weights->data_ptr<float>();
         }

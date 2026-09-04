@@ -1,6 +1,8 @@
 #pragma once
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/math.cuh>
+#include <deep_ep/common/ptx.cuh>
 
 
 namespace deep_ep::elastic::nvfp4 {
@@ -121,6 +123,39 @@ __device__ __forceinline__ void quantize_token(
             dst_scales[i / 2] = scale;
     }
     __syncwarp();
+}
+
+template <int kNumSFPacks, int kExpertCapacity>
+__device__ __forceinline__ void store_expert_scales(
+        const sf_pack_t* packed_scales, sf_pack_t* recv_sf,
+        const int dst_tensor_idx, const int lane_idx) {
+    constexpr int kScaleTokenBlock = 128;
+    constexpr int kNumTokenBlocks = math::constexpr_ceil_div(kExpertCapacity, kScaleTokenBlock);
+    // Each group of four scales is contiguous and aligned in both layouts.
+    const auto src_scales = reinterpret_cast<const uint32_t*>(packed_scales);
+
+    auto mask = ptx::gather(dst_tensor_idx >= 0);
+    while (mask) {
+        const int valid_lane_idx = __ffs(mask) - 1;
+        const auto flat_idx = ptx::exchange(dst_tensor_idx, valid_lane_idx);
+        const auto expert_idx = flat_idx / kExpertCapacity;
+        const auto token_idx = flat_idx % kExpertCapacity;
+        auto dst_scales = reinterpret_cast<uint32_t*>(recv_sf) +
+            expert_idx * kNumTokenBlocks * kNumSFPacks * kScaleTokenBlock;
+
+        const auto token_block_idx = token_idx / kScaleTokenBlock;
+        const auto token_lane_idx = token_idx % 32;
+        const auto token_quad_idx = token_idx % kScaleTokenBlock / 32;
+        #pragma unroll
+        for (int i = lane_idx; i < kNumSFPacks; i += 32) {
+            const auto offset =
+                token_block_idx * (kNumSFPacks * kScaleTokenBlock) +
+                i * kScaleTokenBlock +
+                token_lane_idx * (kScaleTokenBlock / 32) + token_quad_idx;
+            dst_scales[offset] = src_scales[i];
+        }
+        mask ^= 1 << valid_lane_idx;
+    }
 }
 
 }  // namespace deep_ep::elastic::nvfp4

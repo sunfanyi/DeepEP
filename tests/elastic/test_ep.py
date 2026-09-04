@@ -214,6 +214,17 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
         reduced_combined_x, reduced_combined_topk_weights, reduced_combine_event = \
             launch(buffer, 'combine', with_previous_event, async_with_compute_stream, reduced_combine_args)
 
+        if not args.skip_check:
+            scaled_input = (input_for_expand_combine.float() * expanded_recv_topk_weights[:, None] * 2.5).bfloat16()
+            weighted_reference, _, _ = launch(
+                buffer, 'combine', with_previous_event, async_with_compute_stream,
+                reduced_combine_args | dict(x=scaled_input))
+            weighted_combined_x, weighted_combined_weights, _ = launch(
+                buffer, 'combine', with_previous_event, async_with_compute_stream,
+                reduced_combine_args | dict(topk_weights=expanded_recv_topk_weights, routed_scaling_factor=2.5))
+            assert weighted_combined_weights is None
+            assert torch.equal(weighted_combined_x, weighted_reference), 'Fused weighting must preserve BF16 rounding'
+
         assert not (args.dump_profile_traces and args.skip_perf_test), '`--skip-perf-test` should not be specified when `--dump-profile-traces` is provided'
         if not args.skip_perf_test:
             # Profiling

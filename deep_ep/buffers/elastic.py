@@ -831,7 +831,8 @@ class ElasticBuffer:
                 previous_event: EventHandle = None,
                 previous_event_before_epilogue: Optional[EventHandle] = None,
                 async_with_compute_stream: bool = False,
-                allocate_on_comm_stream: bool = False) \
+                allocate_on_comm_stream: bool = False,
+                routed_scaling_factor: float = 1.0) \
             -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
@@ -841,7 +842,9 @@ class ElasticBuffer:
             x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its original ranks.
             handle: a must-set communication handle, you can obtain this from the `dispatch` function.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the tokens' top-k weights for reducing to
-                its original ranks. Not used in expand mode.
+                its original ranks. In expand mode, `[num_expanded_tokens]` weights are applied to
+                expert outputs before reduction; no combined weights are returned.
+            routed_scaling_factor: multiplied after each expert weight in expand mode, before BF16 rounding.
             bias: 0, 1 or 2 `[num_combined_tokens, hidden]` with `torch.bfloat16` final bias to the output.
             num_sms: the number of SMs to use (0 to reuse the SM count from the dispatch handle).
             num_qps: the number of RDMA QPs to use (0 for automatic via `get_theoretical_num_qps`).
@@ -881,5 +884,5 @@ class ElasticBuffer:
                                  previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
-                                 handle.do_expand)
+                                 handle.do_expand, routed_scaling_factor)
         return combined_x, combined_topk_weights, EventOverlap(event)

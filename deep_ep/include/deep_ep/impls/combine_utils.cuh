@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include <deep_ep/common/combine_weighting.cuh>
+
 
 namespace deep_ep::elastic {
 
@@ -52,17 +54,25 @@ void compute_topk_slots(int (&topk_slot_idx)[kNumValidTopk], uint32_t mask,
     }
 }
 
-template <int kHiddenVec, int kUnrollFactor, int kNumExpectedTopk, int kNumValidTopk,
+template <int kHiddenVec, int kUnrollFactor, int kNumExpectedTopk, bool kApplyWeights = false, int kNumValidTopk,
           typename vec_t, typename get_src_buffer_ptr_func_t, typename wait_buffer_func_t>
 __device__ __forceinline__
 void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
                     vec_t* dst_buffer_ptr,
                     const get_src_buffer_ptr_func_t& get_src_buffer_ptr_func,
                     const wait_buffer_func_t& wait_buffer_func,
-                    vec_t* bias_0 = nullptr, vec_t* bias_1 = nullptr) {
+                    vec_t* bias_0 = nullptr, vec_t* bias_1 = nullptr,
+                    const float* expert_weights = nullptr, const float scaling_factor = 1.0f) {
     constexpr int kNumElemsPerVec = sizeof(vec_t) / sizeof(nv_bfloat16);
     EP_STATIC_ASSERT(kNumElemsPerVec % 2 == 0, "Invalid number of elements");
     EP_STATIC_ASSERT(kHiddenVec % (kUnrollFactor * 32) == 0, "Invalid unrolling");
+
+    float weights[kNumValidTopk];
+    if constexpr (kApplyWeights) {
+        #pragma unroll
+        for (int k = 0; k < kNumValidTopk; ++ k)
+            weights[k] = topk_slot_idx[k] >= 0 ? __ldg(expert_weights + topk_slot_idx[k]) : 0.0f;
+    }
 
     // We use BF16 add as much as possible, as casting is slow
     const bool enable_hadd_bypass =
@@ -81,6 +91,8 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
             for (int j = 0; j < kUnrollFactor; ++ j) {
                 values_0[j] = ptx::ldg_with_gez_pred(
                     src_base_ptr_0 + (i * (kUnrollFactor * 32) + j * 32 + lane_idx), slot_0);
+                if constexpr (kApplyWeights)
+                    scale_combine_vector(values_0[j], weights[0], scaling_factor);
             }
 
             // Read values 1
@@ -91,6 +103,8 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
             for (int j = 0; j < kUnrollFactor; ++ j) {
                 values_1[j] = ptx::ldg_with_gez_pred(
                     src_base_ptr_1 + (i * (kUnrollFactor * 32) + j * 32 + lane_idx), slot_1);
+                if constexpr (kApplyWeights and kNumValidTopk > 1)
+                    scale_combine_vector(values_1[j], weights[1], scaling_factor);
             }
 
             // Wait buffer releases for the first write
@@ -142,6 +156,8 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
                 for (int j = 0; j < kUnrollFactor; ++ j) {
                     values[j] = ptx::ldg_with_gez_pred(
                         src_base_ptr + (i * (kUnrollFactor * 32) + j * 32 + lane_idx), topk_slot_idx[k]);
+                    if constexpr (kApplyWeights)
+                        scale_combine_vector(values[j], weights[k], scaling_factor);
                 }
 
                 // Reduce
