@@ -45,6 +45,9 @@ class ElasticBuffer {
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
+    // All routing must exclude this rank's experts; communication and forwarding remain active.
+    bool source_only;
+
     // Timeout settings
     int num_cpu_timeout_secs;
     int64_t num_gpu_timeout_cycles;
@@ -87,14 +90,16 @@ public:
                   const bool& prefer_overlap_with_compute,
                   const int& sl_idx, const int& num_allocated_qps,
                   const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
-                  const bool& explicitly_destroy):
+                  const bool& explicitly_destroy,
+                  const bool& source_only = false):
         num_buffer_bytes(num_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
         comm_stream(at::cuda::getStreamFromPool(true)),
         deterministic(deterministic),
         allow_hybrid_mode(allow_hybrid_mode),
         allow_multiple_reduction(allow_multiple_reduction),
-        prefer_overlap_with_compute(prefer_overlap_with_compute) {
+        prefer_overlap_with_compute(prefer_overlap_with_compute),
+        source_only(source_only) {
         // Init NCCL runtime
         static constexpr int kBufferAlignment = 16;
         this->nccl_context = std::make_shared<nccl::NCCLSymmetricMemoryContext>(
@@ -1033,12 +1038,20 @@ public:
             num_expanded_tokens = math::align(num_expanded_tokens, expert_alignment);
         }
 
+        if (source_only) {
+            if (cached_mode or do_cpu_sync)
+                EP_HOST_ASSERT(num_recv_tokens == 0);
+            num_recv_tokens = 0;
+            num_expanded_tokens = 0;
+        }
+
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
-        const auto num_allocated_tokens = use_nvfp4 ? num_local_experts * expert_capacity :
+        const auto recv_expert_capacity = source_only ? 0 : expert_capacity;
+        const auto num_allocated_tokens = use_nvfp4 ? num_local_experts * recv_expert_capacity :
             (do_expand ? num_expanded_tokens : num_recv_tokens);
         auto recv_x = use_nvfp4 ?
-            torch::empty({num_local_experts, expert_capacity, hidden / 2}, x.options().dtype(torch::kUInt8)) :
+            torch::empty({num_local_experts, recv_expert_capacity, hidden / 2}, x.options().dtype(torch::kUInt8)) :
             torch::empty({num_allocated_tokens, hidden}, x.options());
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();
@@ -1054,7 +1067,7 @@ public:
         int recv_sf_token_stride = 0, recv_sf_hidden_stride = 0;
         if (use_nvfp4) {
             recv_sf = torch::empty(
-                {num_local_experts, expert_capacity / 128, hidden / 64, 32, 4, 4},
+                {num_local_experts, recv_expert_capacity / 128, hidden / 64, 32, 4, 4},
                 x.options().dtype(torch::kFloat8_e4m3fn));
             recv_sf_ptr = recv_sf->data_ptr();
             recv_x = recv_x.permute({1, 2, 0});
@@ -1318,6 +1331,7 @@ public:
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int, int, int, int, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int, int, int, int, bool, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
