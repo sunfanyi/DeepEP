@@ -262,47 +262,50 @@ hybrid_dispatch_impl(
 
             // Wait local counters to be ready
             // NOTES: here we only care the prefix sum by scale-up peers (used for later epilogue), not all ranks
-            EP_STATIC_ASSERT(kNumNotifyWarps == 0 or kNumScaleupRanks + kNumExpertsPerRank <= kNumNotifyWarps * 32,
-                             "Insufficient notify threads");
-            comm::timeout_while<kNumTimeoutCycles>(thread_idx < kNumScaleupRanks + kNumExpertsPerRank,
-                [&](const bool& is_last_check) {
-                const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + thread_idx);
-                if ((status >> 32ull) == kNumScaleupRanks) {
-                    // Clean GPU workspace and write into host workspace
-                    const auto count = static_cast<int>(status & 0xffffffffll);
-                    const auto aligned_count = math::align<int>(
-                        count, (thread_idx < kNumScaleupRanks or kUseNVFP4) ? 1 : kExpertAlignment);
+            // Reuse notify threads when the local counters exceed one round.
+            #pragma unroll
+            for (int offset = 0; offset < kNumScaleupRanks + kNumExpertsPerRank; offset += kNumNotifyThreads) {
+                const int counter_idx = offset + thread_idx;
+                comm::timeout_while<kNumTimeoutCycles>(counter_idx < kNumScaleupRanks + kNumExpertsPerRank,
+                    [&](const bool& is_last_check) {
+                    const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + counter_idx);
+                    if ((status >> 32ull) == kNumScaleupRanks) {
+                        // Clean GPU workspace and write into host workspace
+                        const auto count = static_cast<int>(status & 0xffffffffll);
+                        const auto aligned_count = math::align<int>(
+                            count, (counter_idx < kNumScaleupRanks or kUseNVFP4) ? 1 : kExpertAlignment);
 
-                    workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[thread_idx] = 0;
-                    if constexpr (kDoCPUSync) {
-                        host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[thread_idx] =
-                            math::encode_decode_positive(aligned_count);
-                    }
-
-                    // Update statistics counters
-                    if (cumulative_local_expert_recv_stats != nullptr and thread_idx >= kNumScaleupRanks)
-                        atomicAdd(cumulative_local_expert_recv_stats + (thread_idx - kNumScaleupRanks), count);
-                    if constexpr (kUseNVFP4) {
-                        if (thread_idx >= kNumScaleupRanks) {
-                            EP_DEVICE_ASSERT(count <= kExpertCapacity);
-                            num_recv_tokens_per_expert[thread_idx - kNumScaleupRanks] = count;
+                        workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[counter_idx] = 0;
+                        if constexpr (kDoCPUSync) {
+                            host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[counter_idx] =
+                                math::encode_decode_positive(aligned_count);
                         }
+
+                        // Update statistics counters
+                        if (cumulative_local_expert_recv_stats != nullptr and counter_idx >= kNumScaleupRanks)
+                            atomicAdd(cumulative_local_expert_recv_stats + (counter_idx - kNumScaleupRanks), count);
+                        if constexpr (kUseNVFP4) {
+                            if (counter_idx >= kNumScaleupRanks) {
+                                EP_DEVICE_ASSERT(count <= kExpertCapacity);
+                                num_recv_tokens_per_expert[counter_idx - kNumScaleupRanks] = count;
+                            }
+                        }
+
+                        // Save for later prefix sum calculation
+                        rank_expert_count[counter_idx] = aligned_count;
+                        return true;
                     }
 
-                    // Save for later prefix sum calculation
-                    rank_expert_count[thread_idx] = aligned_count;
-                    return true;
-                }
-
-                if (is_last_check) {
-                    printf("DeepEP hybrid notify (scale-up reduction) timeout,"
-                           "scale-out: %d/%d, scale-up: %d/%d, "
-                           "thread: %d, status: %d | %d, expected: %d\n",
-                           scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, thread_idx,
-                           static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumScaleupRanks);
-                }
-                return false;
-            });
+                    if (is_last_check) {
+                        printf("DeepEP hybrid notify (scale-up reduction) timeout,"
+                               "scale-out: %d/%d, scale-up: %d/%d, "
+                               "thread: %d, status: %d | %d, expected: %d\n",
+                               scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, counter_idx,
+                               static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumScaleupRanks);
+                    }
+                    return false;
+                });
+            }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Do prefix sum by the warps of the first SM
