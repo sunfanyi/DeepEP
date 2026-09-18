@@ -26,5 +26,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     deep_ep::jit::register_apis(m);
-    deep_ep::elastic::register_apis(m);
+    deep_ep::elastic::register_apis(m, true);
 }
