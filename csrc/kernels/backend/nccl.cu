@@ -81,14 +81,15 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     if (get_env<int>("EP_BUFFER_DEBUG"))
         printf("EP NCCL device communicator has %d allocated QPs\n", num_allocated_qps);
 
-    const auto physical_domain_size = get_physical_domain_size(nccl_comm);
-    const bool enable_gin = std::get<0>(physical_domain_size) > 1 and get_env("EP_DISABLE_GIN", 0) == 0;
-    if (enable_gin) {
-        // GIN is only needed when the communicator spans multiple LSA domains.
+    const bool requires_gin = std::get<0>(get_physical_domain_size(nccl_comm)) > 1;
+    bool enable_gin = false;
+    if (get_env("EP_DISABLE_GIN", 0) == 0) {
         ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
         NCCL_CHECK(ncclCommQueryProperties(comm, &props));
+        // Engram and PP still use GIN within a single LSA domain.
+        enable_gin = num_ranks > 1 and (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE;
         EP_HOST_ASSERT(
-            (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
+            (not requires_gin or enable_gin) and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
             "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
     }
