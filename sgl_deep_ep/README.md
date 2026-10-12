@@ -80,7 +80,8 @@ CPU architecture (`x86_64` or `aarch64`). Use the CUDA version and
 architecture of the build environment. The script reads implementation and
 packaging from its own checkout, stages a temporary copy, and leaves the source
 unchanged. `SGL_DEEP_EP_VERSION` overrides `sgl_deep_ep/VERSION`; the wheel
-version includes the corresponding `+cu130` or `+cu134` suffix.
+version includes the corresponding `+cu130` or `+cu134` suffix, or appends
+`.cu130` or `.cu134` to an existing local version.
 `PYTHON_BIN` selects the build interpreter and `MAX_JOBS` controls parallelism.
 
 This produces a native Linux wheel. The SGLang release build script applies

@@ -541,6 +541,107 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
     dist_print('', once_in_node=True)
 
 
+def test_afd(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
+    from deep_ep import afd
+
+    assert buffer.num_ranks == 2, 'AFD test requires F rank 0 and A rank 1'
+    assert (args.num_tokens, args.hidden, args.num_experts, args.num_topk) == (8, 256, 8, 2)
+    is_attn = buffer.rank_idx == 1
+    tokens, hidden, experts, topk, capacity = 8, 256, 8, 2, 128
+    local_experts = experts // buffer.num_ranks
+    num_sms = args.num_sms or 4
+    num_qps = args.num_qps or buffer.get_theoretical_num_qps(num_sms)
+    runtimes = [afd.ElasticBuffer(
+        buffer.rank_idx, buffer.num_ranks, buffer.nccl_comm_handle.get(), [], buffer.num_bytes, 0,
+        args.allow_hybrid_mode, args.allow_multiple_reduction, True, args.sl_idx, buffer.num_allocated_qps,
+        args.num_cpu_timeout_secs, args.num_gpu_timeout_secs, True, is_attn, True) for _ in range(2)]
+    assert len({runtime.get_comm_stream().stream_id for runtime in runtimes}) == 2
+    torch.cuda.synchronize()
+    dist.barrier()
+    for runtime in runtimes:
+        runtime.barrier(True, False, False)
+
+    x = [torch.full((tokens if is_attn else 0, hidden), lane + 1, dtype=torch.bfloat16, device='cuda') for lane in range(2)]
+    indices = [torch.full((t.size(0), topk), -1, dtype=afd.topk_idx_t, device='cuda') for t in x]
+    weights = [torch.tensor([0.25, 0.5], dtype=torch.float32, device='cuda').repeat(t.size(0), 1) for t in x]
+    scale = torch.ones((), dtype=torch.float32, device='cuda')
+    expert_outputs = [torch.empty((0 if is_attn else local_experts * capacity, hidden),
+                                 dtype=torch.bfloat16, device='cuda') for _ in range(2)]
+    for lane, output in enumerate(expert_outputs):
+        for expert in range(0 if is_attn else local_experts):
+            output[expert * capacity:(expert + 1) * capacity].fill_((lane + 1) * (expert + 1))
+
+    def set_routing(valid_tokens, pair):
+        for lane, idx in enumerate(indices):
+            idx.fill_(-1)
+            if is_attn:
+                first_expert = 2 * ((pair + lane) % 2)
+                idx[:valid_tokens, 0].fill_(first_expert)
+                idx[:valid_tokens, 1].fill_(first_expert + 1)
+
+    def round_trip(do_cpu_sync):
+        dispatched = [runtime.dispatch_afd(
+            x[lane], None, indices[lane], weights[lane],
+            *([None] * 11), tokens, experts, capacity, num_sms, num_qps,
+            None, None, True, False, True, do_cpu_sync, True, False, True, True, scale, capacity)
+            for lane, runtime in enumerate(runtimes)]
+        for result in dispatched:
+            result[-1].current_stream_wait()
+        combined = [runtime.combine_afd(
+            expert_outputs[lane], None if is_attn else result[3], None, None,
+            result[11], result[4], result[8], result[13], result[14],
+            experts, tokens, num_sms, num_qps, None, None, True, False, True, 2.0)
+            for lane, (runtime, result) in enumerate(zip(runtimes, dispatched))]
+        for result in combined:
+            result[-1].current_stream_wait()
+            assert result[1] is None
+        return dispatched, combined
+
+    def check(results, valid_tokens, pair):
+        dispatched, combined = results
+        for lane, (received, returned) in enumerate(zip(dispatched, combined)):
+            first_expert = 2 * ((pair + lane) % 2)
+            counts = torch.zeros(local_experts, dtype=torch.int32, device='cuda')
+            if not is_attn:
+                counts[first_expert:first_expert + topk] = valid_tokens
+            assert torch.equal(received[10], counts), f'{lane=}: raw expert counts'
+            assert torch.equal(received[9], torch.arange(local_experts, device='cuda') * capacity + counts), f'{lane=}: expert offsets'
+            assert received[8][-1].item() == (0 if is_attn else valid_tokens)
+            if is_attn:
+                assert all(received[i].numel() == 0 for i in (0, 1, 3, 11))
+            else:
+                assert received[0].shape == (capacity, hidden // 2, local_experts)
+                assert received[1].shape == (32, 4, capacity // 128, 4, hidden // 64, local_experts)
+            expected = torch.zeros((tokens if is_attn else 0, hidden), dtype=torch.bfloat16, device='cuda')
+            if is_attn:
+                expected[:valid_tokens] = 2 * (lane + 1) * ((first_expert + 1) * 0.25 + (first_expert + 2) * 0.5)
+            assert torch.equal(returned[0], expected), f'{lane=}: weighted expert output'
+
+    # Eager CPU synchronization and graph replay must expose the same raw counts.
+    phases = ((8, 0), (3, 1), (0, 0), (8, 1))
+    for valid_tokens, pair in phases:
+        set_routing(valid_tokens, pair)
+        check(round_trip(True), valid_tokens, pair)
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        round_trip(False)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured = round_trip(False)
+    for valid_tokens, pair in phases * 2:
+        set_routing(valid_tokens, pair)
+        graph.replay()
+        check(captured, valid_tokens, pair)
+    torch.cuda.synchronize()
+    graph.reset()
+    for runtime in runtimes:
+        runtime.destroy()
+    dist_print('AFD NVFP4: source-only receives, two lanes, eager and graph routing checks passed', once_in_node=True)
+
+
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 @torch.inference_mode()
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
@@ -567,10 +668,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                    once_in_node=True)
 
     # Test MoE kernels
-    test_dispatch_combine(buffer, args)
+    (test_afd if args.test_afd else test_dispatch_combine)(buffer, args)
 
     # Pressure tests
-    for seed in range(int(1e9) if args.do_pressure_test else 0):
+    for seed in range(int(1e9) if args.do_pressure_test and not args.test_afd else 0):
         if not args.reuse_elastic_buffer:
             # Recreate elastic buffer
             buffer.destroy()
@@ -618,6 +719,7 @@ if __name__ == '__main__':
     parser.add_argument('--do-pressure-test', action='store_true', help='Whether to do pressure test')
     parser.add_argument('--reuse-elastic-buffer', action='store_true', help='Whether to reuse elastic buffer for each test')
     parser.add_argument('--test-first-only', action='store_true', help='Only test the first case')
+    parser.add_argument('--test-afd', action='store_true', help='Test two-rank AFD NVFP4 routing with dedicated lanes and CUDA graphs')
     parser.add_argument('--unbalanced-ratio', type=float, default=1.0, help='The MoE unbalanced ratio')
     parser.add_argument('--precise-unbalanced-ratio', action='store_true', help='Generate topk index with precise unbalanced ratio')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')

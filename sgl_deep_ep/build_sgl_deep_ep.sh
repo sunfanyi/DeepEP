@@ -116,6 +116,7 @@ mv "${STAGING_DIR}/setup.py" "${STAGING_DIR}/_deepep_setup.py"
 cp "${PACKAGING_DIR}/setup.py" "${STAGING_DIR}/setup.py"
 cp "${PACKAGING_DIR}/pyproject.toml" "${STAGING_DIR}/pyproject.toml"
 cp "${PACKAGING_DIR}/README.md" "${STAGING_DIR}/README.md"
+cp "${DEEPEP_SOURCE}/LICENSE" "${STAGING_DIR}/LICENSE.DeepEP"
 cp "${PACKAGING_DIR}/LICENSE" "${STAGING_DIR}/LICENSE"
 cp "${PACKAGING_DIR}/prerequisites.py" "${STAGING_DIR}/deep_ep/prerequisites.py"
 
@@ -133,7 +134,10 @@ mv "${GUARDED_INIT}" "${ORIGINAL_INIT}"
 
 export CUDA_HOME
 export MAX_JOBS="${MAX_JOBS:-8}"
-export SGL_DEEP_EP_VERSION="${PUBLIC_VERSION}+${CUDA_TAG}"
+case "${PUBLIC_VERSION}" in
+    *+*) export SGL_DEEP_EP_VERSION="${PUBLIC_VERSION}.${CUDA_TAG}" ;;
+    *) export SGL_DEEP_EP_VERSION="${PUBLIC_VERSION}+${CUDA_TAG}" ;;
+esac
 export TORCH_CUDA_ARCH_LIST="9.0;10.0;10.3"
 
 rm -rf "${STAGING_DIR}/build" "${STAGING_DIR}/dist"

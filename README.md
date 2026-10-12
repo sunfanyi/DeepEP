@@ -60,23 +60,22 @@ For V1 performance data, see [docs/legacy.md](docs/legacy.md#performance).
 
 ## SGLang AFD
 
-This fork provides `sglang-afd-deepep-v2` for SGLang's `direct_deepep` Attention-FFN Disaggregation (AFD) backend. It is based on upstream DeepEP [`018f21e`](https://github.com/deepseek-ai/DeepEP/commit/018f21ea62c6c2888d9b46806aad6d90b399b23d), with support for attention ranks that hold no experts, NVFP4 dispatch, fixed-capacity expert layouts, and router weighting during combine.
+This fork adds extensions for SGLang's `direct_deepep` Attention-FFN Disaggregation (AFD) backend to [`sgl-project/DeepEP:sgl-deepep@fde9a813`](https://github.com/sgl-project/DeepEP/commit/fde9a813271be9b4e66251a8dbf8f26fd274b4f4). These support attention ranks that hold no experts, NVFP4 dispatch, fixed-capacity expert layouts, and router weighting during combine.
 
-The package installs as `sglang_afd_deepep_v2` and can coexist with `deep_ep`. Its native bindings are registered separately so both packages can be loaded in the same process. The installation instructions and examples in the following sections apply to the upstream `deep_ep` package.
+SGLang's standard `sgl-deep-ep` package already provides both legacy `deep_ep.Buffer` and v2 `deep_ep.ElasticBuffer`. This fork's wheel adds `deep_ep.afd` for SGLang's `direct_deepep` backend in the same package. Current official wheels do not include these AFD extensions.
 
-### Build and install
+### Build the full wheel
 
-Build in the Python and PyTorch environment used to run SGLang. In addition to the [hardware and software requirements](#requirements) below, the AFD build requires Python 3.10 or later, a CUDA development toolkit, `setuptools`, `wheel`, and `ninja`. NCCL must include its device headers and shared library. Use the NCCL version required by the PyTorch environment, with a minimum of 2.30.4.
-
-Run from the repository root. This example targets SM90, SM100, and SM103 with CUDA 13:
+Build in the Python and PyTorch environment used to run SGLang. Install the [full-wheel build dependencies](sgl_deep_ep/README.md#building-from-a-checkout), including NVSHMEM for the legacy APIs. From this fork's checkout, use a local version to distinguish the AFD build from the official package:
 
 ```bash
 git submodule update --init --recursive
-TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3" python setup_afd.py bdist_wheel
-python -m pip install dist/sglang_afd_deepep_v2-*.whl
+SGL_DEEP_EP_VERSION=0.1.2.post1+afd.1 \
+  bash sgl_deep_ep/build_sgl_deep_ep.sh dist 13.0 "$(uname -m)"
+python -m pip install --no-index --find-links dist "sgl-deep-ep==0.1.2.post1+afd.1.cu130"
 ```
 
-`TORCH_CUDA_ARCH_LIST` is required; adjust it to the target GPUs and CUDA toolkit. The AFD build compiles a CUDA extension and uses NCCL only. It does not build the legacy NVSHMEM extension. Rebuild the wheel when changing the Python or PyTorch/CUDA ABI, using a clean build directory.
+This replaces an existing `sgl-deep-ep` installation. Rebuild the wheel when changing the Python or PyTorch/CUDA ABI, using a clean build directory.
 
 ### Runtime setup
 
@@ -85,16 +84,36 @@ Dispatch and combine kernels are compiled at runtime. Keep `nvcc`, `cuobjdump`, 
 From a directory outside the source checkout, check that the installed wheel's native extension and JIT dependencies can be loaded:
 
 ```bash
-python -c "import sglang_afd_deepep_v2 as ep; ep.validate_runtime()"
+python -c "from deep_ep import afd; print(afd.__version__, afd.ElasticBuffer)"
 ```
 
-This check does not run distributed communication kernels. The wheel includes the DeepEP and fmt license texts in `sglang_afd_deepep_v2/licenses/`.
+This import check does not run distributed communication kernels.
 
 ### API
 
-SGLang manages the NCCL communicator, buffer allocation, dispatch, and combine through its `direct_deepep` integration. The package exports the native `ElasticBuffer` binding, not the `deep_ep.ElasticBuffer` Python wrapper used in the examples below. Their constructors and method signatures differ; changing the import in those examples is not sufficient to use the AFD package.
+SGLang manages the NCCL communicator, buffer allocation, dispatch, and combine through its `direct_deepep` integration. `deep_ep.afd` exports native AFD bindings. These differ from the `deep_ep.ElasticBuffer` Python wrapper used in the upstream examples below; changing only the import in those examples is not sufficient.
+
+AFD uses `dispatch_afd` and `combine_afd`. The standard `dispatch` and `combine` methods retain their upstream behavior, including expanded-layout weight transport for backward operations.
 
 Top-k indices use `torch.int64`. `EP_NUM_TOPK_IDX_BITS` defaults to `64` for this package and must not be set to another value.
+
+### Isolated package during migration
+
+The `sglang_afd_deepep_v2` namespace remains available during migration. Consumers must use the 2.1 native API (`dispatch_afd` and `combine_afd`); the 2.0 positional ABI is not supported. Build it from the same checkout and environment:
+
+```bash
+git submodule update --init --recursive
+TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3" python setup_afd.py bdist_wheel
+python -m pip install --no-index --find-links dist "sglang-afd-deepep-v2==2.1.0+fde9a81.afd1"
+```
+
+Adjust `TORCH_CUDA_ARCH_LIST` to the target GPUs. This NCCL-only build does not include the legacy NVSHMEM extension and registers its bindings separately from `deep_ep`. From outside the source checkout, verify loading with:
+
+```bash
+python -c "import sglang_afd_deepep_v2 as ep; ep.validate_runtime()"
+```
+
+The isolated wheel includes the DeepEP and fmt license texts in `sglang_afd_deepep_v2/licenses/`.
 
 ## Quick start
 
