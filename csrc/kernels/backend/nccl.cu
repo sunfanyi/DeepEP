@@ -1,8 +1,6 @@
 #include <cstring>
-#include <memory>
 #include <vector>
 #include <string>
-#include <optional>
 #include <pybind11/pytypes.h>
 #include <pybind11/stl.h>
 #include <sstream>
@@ -61,17 +59,17 @@ std::tuple<int, int> get_logical_domain_size(const int64_t& nccl_comm, const boo
             allow_hybrid_mode ? num_nvl_ranks : num_rdma_ranks * num_nvl_ranks};
 }
 
-NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
+NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm, const symmetric::cpu_comm_t& cpu_comm,
                                                        const int& num_ranks, const int& rank_idx,
-                                                       const size_t& size, const size_t& alignment,
+                                                       const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                                        const bool& allow_hybrid_mode,
                                                        const int& sl_idx, const int& num_allocated_qps):
     rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps) {
+    int nccl_runtime_version;
+    NCCL_CHECK(ncclGetVersion(&nccl_runtime_version));
     if (get_env("EP_BUFFER_DEBUG", 0)) {
-        int nccl_version;
-        NCCL_CHECK(ncclGetVersion(&nccl_version));
         printf("DeepEP initialized with NCCL version: %d.%d.%d (loaded library)\n",
-               nccl_version / 10000, (nccl_version % 10000) / 100, nccl_version % 100);
+               nccl_runtime_version / 10000, (nccl_runtime_version % 10000) / 100, nccl_runtime_version % 100);
     }
 
     // Reuse the NCCL communicator
@@ -81,11 +79,11 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     if (get_env<int>("EP_BUFFER_DEBUG"))
         printf("EP NCCL device communicator has %d allocated QPs\n", num_allocated_qps);
 
+    ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
+    NCCL_CHECK(ncclCommQueryProperties(comm, &props));
     const bool requires_gin = std::get<0>(get_physical_domain_size(nccl_comm)) > 1;
     bool enable_gin = false;
     if (get_env("EP_DISABLE_GIN", 0) == 0) {
-        ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
-        NCCL_CHECK(ncclCommQueryProperties(comm, &props));
         // Engram and PP still use GIN within a single LSA domain.
         enable_gin = num_ranks > 1 and (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE;
         EP_HOST_ASSERT(
@@ -99,16 +97,25 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     if (enable_gin) {
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;
-        reqs.ginQueueDepth = 1024;
+        reqs.ginQueueDepth = kGinQPDepth;
         reqs.ginTrafficClass = sl_idx;
         // Customized RDMA barrier needs extra signals
         reqs.ginSignalCount = num_ranks + 2 * 2;
         reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
     }
-    NCCL_CHECK(ncclDevCommCreate(comm, &reqs, &dev_comm));
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
+    reqs.useRuntimeVersion = true;
+    dev_comm.ptr = malloc(props.devCommRuntimeVersionSize);
+#else
+    EP_HOST_ASSERT(NCCL_VERSION_CODE == nccl_runtime_version and "Prior to NCCL 2.31, NCCL compile-time and runtime versions must be the same. Please re-compile DeepEP.");
+    dev_comm.ptr = malloc(sizeof(ncclDevComm_t));
+#endif
+    EP_HOST_ASSERT(dev_comm.ptr != nullptr);
+    NCCL_CHECK(ncclDevCommCreate(comm, &reqs, static_cast<ncclDevComm_t*>(dev_comm.ptr)));
 
     // Now we know the NVLink domain size
-    num_nvl_ranks = dev_comm.lsaSize, nvl_rank_idx = dev_comm.lsaRank;
+    ncclTeam_t lsaTeam = ncclTeamLsa(comm);
+    num_nvl_ranks = lsaTeam.nRanks, nvl_rank_idx = lsaTeam.rank;
     num_rdma_ranks = num_ranks / num_nvl_ranks, rdma_rank_idx = rank_idx / num_nvl_ranks;
     EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0 and nvl_rank_idx == rank_idx % num_nvl_ranks);
     EP_HOST_ASSERT(rank_idx == rdma_rank_idx * num_nvl_ranks + nvl_rank_idx);
@@ -123,11 +130,20 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     }
     is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
 
+    // Create symmetric memory
+    // num_bytes = GPU + CPU, derive GPU portion
+    this->symmetric_memory = symmetric::alloc(
+        num_bytes - num_cpu_bytes, num_cpu_bytes,
+        allow_hybrid_mode, num_scaleup_ranks, scaleout_rank_idx,
+        cpu_comm);
+
     // Create window
     // NOTES: `ncclCommWindowRegister` is collective: it internally calls bootstrapBarrier
     // across all ranks, so no explicit barrier is needed after this call.
-    NCCL_CHECK(ncclMemAlloc(&raw_window_ptr, size));
-    NCCL_CHECK(ncclCommWindowRegister(comm, raw_window_ptr, size, &window, NCCL_WIN_DEFAULT));
+    raw_window_ptr = this->symmetric_memory->ptr;
+    this->num_gpu_bytes = this->symmetric_memory->num_gpu_bytes;
+    this->num_cpu_bytes = this->symmetric_memory->num_cpu_bytes;
+    NCCL_CHECK(ncclCommWindowRegister(comm, raw_window_ptr, this->symmetric_memory->num_bytes, &window, NCCL_WIN_STRICT_ORDERING));
     NCCL_CHECK(ncclGetLsaDevicePointer(window, 0, nvl_rank_idx, &mapped_window_ptr));
 
     // Get LSA pointers for all LSA peers
@@ -135,11 +151,6 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     nvl_window_ptrs.resize(num_nvl_ranks);
     for (int i = 0; i < num_nvl_ranks; ++ i)
         NCCL_CHECK(ncclGetLsaDevicePointer(window, 0, i, &nvl_window_ptrs[i]));
-
-    // TODO: push NCCL team to support aligned allocation
-    EP_HOST_ASSERT(size % alignment == 0);
-    EP_HOST_ASSERT(reinterpret_cast<uint64_t>(raw_window_ptr) % alignment == 0);
-    EP_HOST_ASSERT(reinterpret_cast<uint64_t>(mapped_window_ptr) % alignment == 0);
 }
 
 void* NCCLSymmetricMemoryContext::get_sym_ptr(void* ptr, const int& dst_rank_idx) const {
@@ -147,13 +158,14 @@ void* NCCLSymmetricMemoryContext::get_sym_ptr(void* ptr, const int& dst_rank_idx
     return static_cast<uint8_t*>(nvl_window_ptrs[dst_rank_idx]) + offset;
 }
 
-void NCCLSymmetricMemoryContext::finalize() const {
-    // Deregister window and free buffer
+void NCCLSymmetricMemoryContext::finalize() {
+    // Deregister window
     NCCL_CHECK(ncclCommWindowDeregister(comm, window));
-    NCCL_CHECK(ncclMemFree(raw_window_ptr));
+    symmetric_memory.reset();
 
     // Destroy device communicator
-    NCCL_CHECK(ncclDevCommDestroy(comm, &dev_comm));
+    NCCL_CHECK(ncclDevCommDestroy(comm, static_cast<ncclDevComm_t*>(dev_comm.ptr)));
+    free(dev_comm.ptr);
 }
 
 }  // namespace deep_ep::nccl

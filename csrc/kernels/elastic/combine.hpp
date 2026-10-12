@@ -33,7 +33,7 @@ public:
         int* psum_num_recv_tokens_per_scaleup_rank;
         int* token_metadata_at_forward;
         int* channel_linked_list;
-        ncclDevComm_t nccl_dev_comm;
+        jit::NoRefPtr nccl_dev_comm;
         ncclWindow_t nccl_window;
         void* buffer;
         void* workspace;
@@ -115,11 +115,12 @@ static layout::TokenLayout get_combine_token_layout(
 static void* launch_combine(void* x,
                             void* topk_weights,
                             const float routed_scaling_factor,
+                            const bool& apply_weights,
                             int* src_metadata,
                             int* psum_num_recv_tokens_per_scaleup_rank,
                             int* token_metadata_at_forward,
                             int* channel_linked_list,
-                            const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+                            const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
                             void* buffer, void* workspace,
                             const int& num_reduced_tokens, const int& num_max_tokens_per_rank,
                             const int& hidden,
@@ -155,7 +156,7 @@ static void* launch_combine(void* x,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
-        .apply_weights = use_expanded_layout and topk_weights != nullptr,
+        .apply_weights = apply_weights,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,

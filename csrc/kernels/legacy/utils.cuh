@@ -382,6 +382,15 @@ __device__ __forceinline__ void tma_store_fence() {
     asm volatile("fence.proxy.async.shared::cta;");
 }
 
+__device__ __forceinline__ void fence_view_async_shared() {
+    asm volatile (
+        "{\n\t"
+        "fence.proxy.async.shared::cta; \n"
+        "}"
+        ::
+        : "memory");
+}
+
 constexpr uint64_t kEvictFirst = 0x12f0000000000000;
 constexpr uint64_t kEvictNormal = 0x1000000000000000;
 
@@ -636,6 +645,18 @@ __forceinline__ __device__ T warp_reduce_and(T value) {
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
+}
+
+__device__ __forceinline__ void wait_signal(uint32_t* addr, uint32_t expect_value) {
+    while (true) {
+        uint32_t ready = 0;
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(ready) : "l"(addr) : "memory");
+
+        if (ready == expect_value)
+            return;
+
+        asm volatile("nanosleep.u32 20;");
+    }
 }
 
 }  // namespace deep_ep::legacy

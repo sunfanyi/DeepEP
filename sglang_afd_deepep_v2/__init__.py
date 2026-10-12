@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "2.0.0+018f21e.afd5"
-UPSTREAM_COMMIT = "018f21ea62c6c2888d9b46806aad6d90b399b23d"
+__version__ = "2.1.0+fde9a81.afd1"
+UPSTREAM_COMMIT = "fde9a813271be9b4e66251a8dbf8f26fd274b4f4"
 TOPK_IDX_BITS = 64
 
 _NATIVE_EXPORTS = frozenset(

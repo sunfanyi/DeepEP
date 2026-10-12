@@ -25,7 +25,7 @@ template <bool kDoCPUSync,
           int kNumChannelsPerSM = kNumScaleoutWarps,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
-          int kScaleoutUpdateInterval = 3,
+          int kScaleoutUpdateInterval = 6,
           int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
@@ -40,7 +40,7 @@ hybrid_dispatch_impl(
     int* cumulative_local_expert_recv_stats,
     int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert,
-    int* num_recv_tokens_per_expert,
+    int* num_unaligned_recv_tokens_per_expert,
     int* dst_buffer_slot_idx,
     int* token_metadata_at_forward,
     const int num_tokens,
@@ -284,11 +284,11 @@ hybrid_dispatch_impl(
                         // Update statistics counters
                         if (cumulative_local_expert_recv_stats != nullptr and counter_idx >= kNumScaleupRanks)
                             atomicAdd(cumulative_local_expert_recv_stats + (counter_idx - kNumScaleupRanks), count);
-                        if constexpr (kUseNVFP4) {
-                            if (counter_idx >= kNumScaleupRanks) {
+                        if (counter_idx >= kNumScaleupRanks) {
+                            if (num_unaligned_recv_tokens_per_expert != nullptr)
+                                num_unaligned_recv_tokens_per_expert[counter_idx - kNumScaleupRanks] = count;
+                            if constexpr (kUseNVFP4)
                                 EP_DEVICE_ASSERT(count <= kExpertCapacity);
-                                num_recv_tokens_per_expert[counter_idx - kNumScaleupRanks] = count;
-                            }
                         }
 
                         // Save for later prefix sum calculation

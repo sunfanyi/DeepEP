@@ -7,6 +7,9 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include "symmetric.hpp"
+#include "../../jit/no_ref.hpp"
+
 // TODO: make a unified API
 namespace deep_ep::nvshmem {
 
@@ -45,6 +48,7 @@ struct NCCLSymmetricMemoryContext {
 private:
     // Can not use this unmapped pointer from outside
     void* raw_window_ptr;
+    std::shared_ptr<symmetric::SymmetricMemory> symmetric_memory;
 
 public:
     // Global
@@ -62,7 +66,7 @@ public:
 
     // NCCL handles
     ncclComm_t comm;
-    ncclDevComm_t dev_comm;
+    jit::NoRefPtr dev_comm;
     ncclWindow_t window;
     void* mapped_window_ptr;
     std::vector<void*> nvl_window_ptrs;
@@ -70,9 +74,13 @@ public:
     // Configs
     int num_allocated_qps;
 
-    NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
+    // Buffer size
+    int64_t num_gpu_bytes;
+    int64_t num_cpu_bytes;
+
+    NCCLSymmetricMemoryContext(const int64_t& nccl_comm, const symmetric::cpu_comm_t& cpu_comm,
                                const int& num_ranks, const int& rank_idx,
-                               const size_t& size, const size_t& alignment,
+                               const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                const bool& allow_hybrid_mode,
                                const int& sl_idx, const int& num_allocated_qps);
 
@@ -81,7 +89,7 @@ public:
 
     void* get_sym_ptr(void* ptr, const int& dst_rank_idx) const;
 
-    void finalize() const;
+    void finalize();
 };
 
 }  // deep_ep::nccl
