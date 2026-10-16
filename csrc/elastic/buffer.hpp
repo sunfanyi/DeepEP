@@ -917,7 +917,7 @@ public:
                 {nccl_context->num_scaleup_ranks}, at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
         }
 
-        // Decide number of channels by shared memory consumption
+        // Bound hybrid channels by SM resources and the shared token bucket.
         // Only for hybrid version
         int num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
@@ -935,6 +935,17 @@ public:
                 /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            if (cached_mode) {
+                // Cached dispatch must preserve the channel layout in its handle.
+                const auto cached_channels = cached_dst_buffer_slot_idx->size(0);
+                EP_HOST_ASSERT(cached_channels > 0 and cached_channels % num_sms == 0);
+                EP_HOST_ASSERT(cached_channels / num_sms <= num_channels_per_sm);
+                num_channels_per_sm = cached_channels / num_sms;
+            } else {
+                // Empty channels still exchange completion notifications.
+                num_channels_per_sm = std::min(num_channels_per_sm,
+                    std::max(1, math::ceil_div(num_max_tokens_per_rank, num_sms)));
+            }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
