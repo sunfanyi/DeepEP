@@ -1507,8 +1507,8 @@ public:
     }
 };
 
-static void register_apis(pybind11::module_& m, bool module_local = false) {
-    pybind11::class_<ElasticBuffer>(m, "ElasticBuffer", pybind11::module_local(module_local))
+static void register_apis(pybind11::module_& m) {
+    pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool, bool, bool>())
         .def("destroy", &ElasticBuffer::destroy)
