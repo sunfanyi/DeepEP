@@ -91,7 +91,8 @@ public:
                   const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                   const bool& explicitly_destroy,
                   const bool& source_only = false,
-                  const bool& dedicated_comm_stream = false):
+                  const bool& dedicated_comm_stream = false,
+                  const bool& allow_nvlink_without_gin = false):
         num_buffer_bytes(num_buffer_bytes),
         num_cpu_buffer_bytes(num_cpu_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
@@ -117,7 +118,7 @@ public:
         this->nccl_context = std::make_shared<nccl::NCCLSymmetricMemoryContext>(
             nccl_comm, cpu_comm, num_ranks, rank_idx,
             num_sym_bytes, num_cpu_buffer_bytes,
-            allow_hybrid_mode, sl_idx, num_allocated_qps);
+            allow_hybrid_mode, sl_idx, num_allocated_qps, allow_nvlink_without_gin);
 
         // Verify the symmetric memory layout matches our expectations
         EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes == nccl_context->num_gpu_bytes);
@@ -730,7 +731,7 @@ public:
              const bool& do_handle_copy, const bool& do_cpu_sync,
              const bool& do_expand, const bool& do_zero_padding,
              const bool& use_tma_aligned_col_major_sf) const {
-        return dispatch_afd(
+        return dispatch_impl<false>(
             x, sf, topk_idx, topk_weights,
             cumulative_local_expert_recv_stats, cached_num_recv_tokens, cached_num_expanded_tokens,
             cached_num_recv_tokens_per_expert_list, cached_psum_num_recv_tokens_per_scaleup_rank,
@@ -744,6 +745,7 @@ public:
             false, std::nullopt, 0);
     }
 
+    template <bool kAFD>
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -753,7 +755,7 @@ public:
                torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<EventHandle>>
-    dispatch_afd(const torch::Tensor& x,
+    dispatch_impl(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
              const torch::Tensor& topk_idx,
              const std::optional<torch::Tensor>& topk_weights,
@@ -935,16 +937,18 @@ public:
                 /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
-            if (cached_mode) {
-                // Cached dispatch must preserve the channel layout in its handle.
-                const auto cached_channels = cached_dst_buffer_slot_idx->size(0);
-                EP_HOST_ASSERT(cached_channels > 0 and cached_channels % num_sms == 0);
-                EP_HOST_ASSERT(cached_channels / num_sms <= num_channels_per_sm);
-                num_channels_per_sm = cached_channels / num_sms;
-            } else {
-                // Empty channels still exchange completion notifications.
-                num_channels_per_sm = std::min(num_channels_per_sm,
-                    std::max(1, math::ceil_div(num_max_tokens_per_rank, num_sms)));
+            if constexpr (kAFD) {
+                if (cached_mode) {
+                    // Cached dispatch must preserve the channel layout in its handle.
+                    const auto cached_channels = cached_dst_buffer_slot_idx->size(0);
+                    EP_HOST_ASSERT(cached_channels > 0 and cached_channels % num_sms == 0);
+                    EP_HOST_ASSERT(cached_channels / num_sms <= num_channels_per_sm);
+                    num_channels_per_sm = cached_channels / num_sms;
+                } else {
+                    // Empty channels still exchange completion notifications.
+                    num_channels_per_sm = std::min(num_channels_per_sm,
+                        std::max(1, math::ceil_div(num_max_tokens_per_rank, num_sms)));
+                }
             }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
@@ -1229,7 +1233,7 @@ public:
 
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_dispatch_copy_epilogue(buffer, workspace,
+        launch_dispatch_copy_epilogue<kAFD>(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
                                       recv_x.data_ptr(), recv_sf_ptr,
@@ -1510,7 +1514,7 @@ public:
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
-        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool, bool, bool, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
@@ -1528,7 +1532,7 @@ static void register_apis(pybind11::module_& m) {
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine)
-        .def("dispatch_afd", &ElasticBuffer::dispatch_afd)
+        .def("dispatch_afd", &ElasticBuffer::dispatch_impl<true>)
         .def("combine_afd", &ElasticBuffer::combine_afd);
     m.def("create_cpu_handle", &ElasticBuffer::create_cpu_handle);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);

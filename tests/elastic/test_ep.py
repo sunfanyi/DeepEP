@@ -230,31 +230,6 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
         reduced_combined_x, reduced_combined_topk_weights, reduced_combine_event = \
             launch(buffer, 'combine', with_previous_event, async_with_compute_stream, reduced_combine_args)
 
-        if not args.skip_check:
-            scaled_input = (input_for_expand_combine.float() * expanded_recv_topk_weights[:, None] * 2.5).bfloat16()
-            weighted_reference, _, _ = launch(
-                buffer, 'combine', with_previous_event, async_with_compute_stream,
-                reduced_combine_args | dict(x=scaled_input))
-            bias_0, bias_1 = buffer._unpack_bias(bias)
-            weighted_combined_x, weighted_combined_weights, weighted_event = buffer.runtime.combine_afd(
-                input_for_expand_combine, expanded_recv_topk_weights,
-                bias_0, bias_1,
-                expanded_handle.recv_src_metadata,
-                expanded_handle.topk_idx,
-                expanded_handle.psum_num_recv_tokens_per_scaleup_rank,
-                expanded_handle.token_metadata_at_forward,
-                expanded_handle.channel_linked_list,
-                expanded_handle.num_experts,
-                expanded_handle.num_max_tokens_per_rank,
-                num_sms, num_qps,
-                buffer.capture() if with_previous_event else None,
-                None, async_with_compute_stream, allocate_on_comm_stream,
-                True, 2.5)
-            if async_with_compute_stream:
-                weighted_event.current_stream_wait()
-            assert weighted_combined_weights is None
-            assert torch.equal(weighted_combined_x, weighted_reference), 'Fused weighting must preserve BF16 rounding'
-
         assert not (args.dump_profile_traces and args.skip_perf_test), '`--skip-perf-test` should not be specified when `--dump-profile-traces` is provided'
         if not args.skip_perf_test:
             # Profiling
@@ -554,7 +529,7 @@ def test_afd(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
     runtimes = [afd.ElasticBuffer(
         buffer.rank_idx, buffer.num_ranks, buffer.nccl_comm_handle.get(), [], buffer.num_bytes, 0,
         args.allow_hybrid_mode, args.allow_multiple_reduction, True, args.sl_idx, buffer.num_allocated_qps,
-        args.num_cpu_timeout_secs, args.num_gpu_timeout_secs, True, is_attn, True) for _ in range(2)]
+        args.num_cpu_timeout_secs, args.num_gpu_timeout_secs, True, is_attn, True, True) for _ in range(2)]
     assert len({runtime.get_comm_stream().stream_id for runtime in runtimes}) == 2
     torch.cuda.synchronize()
     dist.barrier()
@@ -579,7 +554,7 @@ def test_afd(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
                 idx[:valid_tokens, 0].fill_(first_expert)
                 idx[:valid_tokens, 1].fill_(first_expert + 1)
 
-    def round_trip(do_cpu_sync):
+    def round_trip(do_cpu_sync, routed_scaling_factor=2.0):
         dispatched = [runtime.dispatch_afd(
             x[lane], None, indices[lane], weights[lane],
             *([None] * 11), tokens, experts, capacity, num_sms, num_qps,
@@ -590,7 +565,7 @@ def test_afd(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
         combined = [runtime.combine_afd(
             expert_outputs[lane], None if is_attn else result[3], None, None,
             result[11], result[4], result[8], result[13], result[14],
-            experts, tokens, num_sms, num_qps, None, None, True, False, True, 2.0)
+            experts, tokens, num_sms, num_qps, None, None, True, False, True, routed_scaling_factor)
             for lane, (runtime, result) in enumerate(zip(runtimes, dispatched))]
         for result in combined:
             result[-1].current_stream_wait()
@@ -637,6 +612,24 @@ def test_afd(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
         check(captured, valid_tokens, pair)
     torch.cuda.synchronize()
     graph.reset()
+
+    # Match explicit BF16 rounding before reducing weighted expert outputs.
+    for output in expert_outputs:
+        output.normal_()
+    for weight in weights:
+        weight.copy_(torch.tensor([0.37, 0.61], device='cuda'))
+    dispatched, combined = round_trip(True, routed_scaling_factor=2.5)
+    for lane, (runtime, received, returned) in enumerate(zip(runtimes, dispatched, combined)):
+        scaled_input = expert_outputs[lane]
+        if not is_attn:
+            scaled_input = (scaled_input.float() * received[3][:, None] * 2.5).bfloat16()
+        weighted_reference, _, event = runtime.combine(
+            scaled_input, None, None, None,
+            received[11], received[4], received[8], received[13], received[14],
+            experts, tokens, num_sms, num_qps, None, None, True, False, True)
+        event.current_stream_wait()
+        assert torch.equal(returned[0], weighted_reference), 'Fused weighting must preserve BF16 rounding'
+
     for runtime in runtimes:
         runtime.destroy()
     dist_print('AFD NVFP4: source-only receives, two lanes, eager and graph routing checks passed', once_in_node=True)

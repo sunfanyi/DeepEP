@@ -28,7 +28,7 @@ barrier_impl(const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window, 
                             kNumSMs, kNumThreads, comm::kFlushAllAllocatedQPs, kNumTimeoutCycles, comm::kKernelBarrierTag, false, false, false>(
                     gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, true, false);
 
-        // Scaleup barrier, and it needs to flush the RDMA requests issued by scaleout barrier
+        // Scaleup barrier, and it needs to flush the RDMA requests issued by scaleout barrier 
         comm::gpu_barrier<kIsScaleupNVLink, kNumScaleoutRanks, kNumScaleupRanks,
                         kNumSMs, kNumThreads, comm::kFlushAllAllocatedQPs, kNumTimeoutCycles, comm::kKernelBarrierTag, true, true, false>(
                 gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, false, true);

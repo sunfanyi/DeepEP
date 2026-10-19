@@ -131,20 +131,28 @@ combine_impl(nv_bfloat16* x,
                 token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
             // No reduce
-            if (ptx::elect_one_sync()) {
-                const auto load_ptr =
-                    math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
-                ptx::tma_store_wait();
-                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-            }
             if constexpr (kApplyWeights) {
+                if (ptx::elect_one_sync()) {
+                    const auto load_ptr =
+                        math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                    ptx::tma_store_wait();
+                    ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
                 scale_combine_buffer<kHiddenVec>(
                     lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                     __ldg(topk_weights + token_idx_in_tensor), routed_scaling_factor);
             }
             if (ptx::elect_one_sync()) {
+                if constexpr (not kApplyWeights) {
+                    const auto load_ptr =
+                        math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                    ptx::tma_store_wait();
+                    ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
                 ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
                 ptx::tma_store_commit();
             }
@@ -192,19 +200,25 @@ combine_impl(nv_bfloat16* x,
                 if (slot_idx >= 0) {
                     const auto src_token_ptr = math::advance_ptr<int4>(x, slot_idx * static_cast<int64_t>(kNumHiddenBytes));
                     const auto token_buffer = recv_buffer.get_rank_buffer(k).get_token_buffer(src_token_idx);
-                    if (ptx::elect_one_sync()) {
-                        // Load
-                        ptx::tma_store_wait();
-                        ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kNumHiddenBytes);
-                        ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-                    }
                     if constexpr (kApplyWeights) {
+                        if (ptx::elect_one_sync()) {
+                            ptx::tma_store_wait();
+                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                        }
                         scale_combine_buffer<kHiddenVec>(
                             lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                             __ldg(topk_weights + slot_idx), routed_scaling_factor);
                     }
                     if (ptx::elect_one_sync()) {
+                        if constexpr (not kApplyWeights) {
+                            // Load
+                            ptx::tma_store_wait();
+                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                        }
                         if (nvlink_bypass) {
                             // Write into the same position
                             ptx::tma_store_1d(gin.get_sym_ptr<team_t>(token_buffer.get_base_ptr(), src_rank_idx),

@@ -9,7 +9,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kUseNVFP4,
+template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kUseNVFP4, bool kAFD,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -64,8 +64,10 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1];
-    else if (num_recv_tokens == 0)
-        EP_DEVICE_ASSERT(psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1] == 0);
+    else if constexpr (kAFD) {
+        if (num_recv_tokens == 0)
+            EP_DEVICE_ASSERT(psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1] == 0);
+    }
 
     // Current rank indices should be maintained
     int current_rank_idx = -1, stored_psum_num_recv_tokens;

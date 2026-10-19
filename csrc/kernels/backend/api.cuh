@@ -82,7 +82,8 @@ public:
                                const int& num_ranks, const int& rank_idx,
                                const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                const bool& allow_hybrid_mode,
-                               const int& sl_idx, const int& num_allocated_qps);
+                               const int& sl_idx, const int& num_allocated_qps,
+                               const bool& allow_nvlink_without_gin = false);
 
     // TODO: finish this with `explicit_destroy`
     // ~NCCLSymmetricMemoryContext();

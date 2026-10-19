@@ -244,7 +244,7 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding, use_nvfp4;
+        bool do_expand, cached_mode, do_zero_padding, use_nvfp4, is_afd;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -275,10 +275,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
-                           args.do_expand, args.cached_mode, args.do_zero_padding, args.use_nvfp4,
+                           args.do_expand, args.cached_mode, args.do_zero_padding, args.use_nvfp4, args.is_afd,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
@@ -301,6 +301,7 @@ static void __instantiate_kernel() {{
     }
 };
 
+template <bool kAFD>
 static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* psum_num_recv_tokens_per_scaleup_rank,
                                           int* psum_num_recv_tokens_per_expert,
@@ -329,6 +330,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding, .use_nvfp4 = use_nvfp4,
+        .is_afd = kAFD,
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,

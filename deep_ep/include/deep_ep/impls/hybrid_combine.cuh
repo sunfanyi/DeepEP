@@ -282,20 +282,27 @@ hybrid_combine_impl(nv_bfloat16* x,
                         if (topk_slot_idx < 0)
                             continue;
 
-                        if (ptx::elect_one_sync()) {
-                            // Load
-                            const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
-                            ptx::tma_store_wait();
-                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
-                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-                        }
                         if constexpr (kApplyWeights) {
+                            if (ptx::elect_one_sync()) {
+                                const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
+                                ptx::tma_store_wait();
+                                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                            }
                             scale_combine_buffer<kHiddenVec>(
                                 lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                                 __ldg(topk_weights + topk_slot_idx), routed_scaling_factor);
                         }
                         if (ptx::elect_one_sync()) {
+                            if constexpr (not kApplyWeights) {
+                                // Load
+                                const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
+                                ptx::tma_store_wait();
+                                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                            }
                             // Store
                             const auto dst_token_buffer = scaleup_buffer
                                 .get_rank_buffer(k)
@@ -326,12 +333,11 @@ hybrid_combine_impl(nv_bfloat16* x,
                 // Issue TMA stores into remote scale-up buffer
                 // NOTES: `kDoExpandedSend` mode has already issued
                 if (not kDoExpandedSend) {
-                    // Wait TMA arrival (only for non-reduced cases)
-                    if (no_local_reduce and ptx::elect_one_sync()) {
-                        ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-                    }
                     if constexpr (kApplyWeights) {
+                        if (no_local_reduce and ptx::elect_one_sync()) {
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                        }
                         if (no_local_reduce) {
                             scale_combine_buffer<kHiddenVec>(
                                 lane_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
@@ -340,6 +346,13 @@ hybrid_combine_impl(nv_bfloat16* x,
                     }
                     // Issue stores
                     if (ptx::elect_one_sync()) {
+                        if constexpr (not kApplyWeights) {
+                            // Wait TMA arrival (only for non-reduced cases)
+                            if (no_local_reduce) {
+                                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                            }
+                        }
                         ptx::tma_store_1d(
                             token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(),
                             token_layout.get_num_bytes<false>());

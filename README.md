@@ -75,8 +75,11 @@ python -c "from deep_ep import afd; print(afd.__version__, afd.ElasticBuffer)"
 This checks native extension loading and JIT dependencies. To test two-lane routing with eager execution and CUDA Graph replay on two GPUs:
 
 ```bash
-python tests/elastic/test_ep.py --num-processes 2 --test-afd
+python tests/elastic/test_ep.py --num-processes 2 --test-afd \
+  --num-tokens 8 --hidden 256 --num-experts 8 --num-topk 2
 ```
+
+This test also constructs a standard buffer for setup. On a single NVLink domain without NCCL GIN, run it with `EP_DISABLE_GIN=1`. The AFD constructor supports this topology without the environment override.
 
 ## Quick start
 
